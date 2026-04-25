@@ -1,0 +1,7 @@
+com/example/repository/StudentRepository.class
+com/example/entity/Student.class
+com/example/SqliteDemoApplication.class
+com/example/controller/ScoreController.class
+com/example/entity/Score.class
+com/example/controller/StudentController.class
+com/example/repository/ScoreRepository.class
