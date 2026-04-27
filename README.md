@@ -3434,6 +3434,628 @@ cluster.setPrimaryInstance('root@mysql1:3306')
 
 ---
 
+## 9. MySQL 是否有嵌入式版本？开发/生产环境数据库切换方案
+
+### 9.1 核心问题解答
+
+#### 问题一：MySQL 是否有像 SQLite 一样的嵌入式版本？
+
+**答案：没有官方的嵌入式版本。**
+
+| 数据库 | 嵌入式支持 | 进程内运行 | 说明 |
+| ------ | ---------- | ---------- | ---- |
+| **SQLite** | ✅ 原生支持 | ✅ 运行在应用进程内 | 单文件数据库，零配置 |
+| **MySQL** | ❌ 无官方支持 | ❌ 需要独立服务器进程 | MySQL Embedded 已废弃 |
+| **H2** | ✅ 原生支持 | ✅ 运行在应用进程内 | 纯 Java，支持 MySQL 兼容模式 |
+| **MariaDB4j** | ⚠️ 通过封装实现 | ⚠️ 启动独立进程 | 由应用管理 MariaDB 进程 |
+
+**历史说明**：MySQL 曾经有 `MySQL Embedded Server` 版本（`libmysqld`），允许将 MySQL 引擎链接到应用程序中运行。但该功能在 MySQL 5.7 中已被弃用，并在 MySQL 8.0 中完全移除。
+
+#### 问题二：为什么无法做到"开发用 SQLite，生产用 MySQL"？
+
+**核心原因：SQL 语法和行为存在差异**
+
+| 特性 | SQLite | MySQL 8.0 | 差异影响 |
+| ---- | ------ | --------- | -------- |
+| 自增主键 | `AUTOINCREMENT` | `AUTO_INCREMENT` | SQL 语法不同 |
+| 字符串拼接 | `\|\|` | `CONCAT()` | SQL 语法不同 |
+| 日期函数 | `DATE('now')` | `CURDATE()` | SQL 语法不同 |
+| 数据类型 | 动态类型系统 | 严格类型系统 | 行为差异大 |
+| 日期时间 | 无原生类型（TEXT/INTEGER） | 原生 `DATE/DATETIME` | 行为差异大 |
+| 窗口函数 | 部分支持 | 完全支持 | 复杂查询不兼容 |
+| 外键约束 | 默认不强制 | 默认强制 | 数据一致性不同 |
+| 事务隔离 | 仅 2 种级别 | 4 种级别 | 并发行为不同 |
+| JSON 类型 | 无（TEXT 存储） | 原生 `JSON` | 查询语法不同 |
+
+**实际风险示例**：
+
+```sql
+-- SQLite：字符串拼接
+SELECT 'Hello' || ' ' || 'World';
+
+-- MySQL：相同的 SQL 会报错或返回 0（逻辑或操作）
+SELECT 'Hello' || ' ' || 'World';  -- MySQL 中 || 是逻辑或！
+
+-- MySQL 正确写法
+SELECT CONCAT('Hello', ' ', 'World');
+```
+
+```sql
+-- SQLite：自增主键
+CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);
+
+-- MySQL：相同的 SQL 会报错
+CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT);  -- 错误！
+
+-- MySQL 正确写法
+CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT);
+```
+
+### 9.2 解决方案
+
+#### 方案一：H2 Database（MySQL 兼容模式）⭐ 推荐用于快速开发
+
+**H2** 是一个纯 Java 编写的嵌入式数据库，可以运行在内存模式或文件模式。它支持 **MySQL 兼容模式**，可以模拟大部分 MySQL 语法。
+
+**优势**：
+- 启动极快
+- 支持内存模式（测试后自动清理）
+- 支持 MySQL 兼容模式
+
+**劣势**：
+- 不是 100% 语法兼容
+- 部分高级特性不支持（存储过程、触发器等）
+
+##### 依赖配置
+
+```xml
+<dependencies>
+    <!-- H2 Database -->
+    <dependency>
+        <groupId>com.h2database</groupId>
+        <artifactId>h2</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    
+    <!-- Spring Boot JDBC/JPA -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+</dependencies>
+```
+
+##### 多环境配置
+
+**开发环境**（`application-dev.properties`）：
+
+```properties
+# H2 数据库 - MySQL 兼容模式
+spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;MODE=MySQL;DATABASE_TO_LOWER=TRUE
+spring.datasource.driver-class-name=org.h2.Driver
+spring.datasource.username=sa
+spring.datasource.password=
+
+# H2 控制台（开发环境）
+spring.h2.console.enabled=true
+spring.h2.console.path=/h2-console
+
+# 初始化数据库
+spring.sql.init.mode=always
+spring.sql.init.schema-locations=classpath:schema-h2.sql
+
+# JPA 配置（如果使用 JPA）
+spring.jpa.hibernate.ddl-auto=create-drop
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect
+```
+
+**生产环境**（`application-prod.properties`）：
+
+```properties
+# MySQL 8.0 生产环境
+spring.datasource.url=jdbc:mysql://localhost:3306/mydb?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8mb4
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+spring.datasource.username=root
+spring.datasource.password=your_password
+
+# HikariCP 连接池
+spring.datasource.hikari.maximum-pool-size=10
+
+# 初始化模式
+spring.sql.init.mode=never
+
+# JPA 配置
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.MySQL8Dialect
+```
+
+**主配置**（`application.properties`）：
+
+```properties
+# 环境切换
+spring.profiles.active=dev
+# 生产环境设置为：spring.profiles.active=prod
+```
+
+##### H2 MySQL 兼容模式限制
+
+| MySQL 特性 | H2 兼容情况 | 说明 |
+| ---------- | ----------- | ---- |
+| `AUTO_INCREMENT` | ✅ 支持 | 兼容 |
+| `LIMIT` | ✅ 支持 | 兼容 |
+| `IFNULL()` | ✅ 支持 | 兼容 |
+| `CONCAT()` | ✅ 支持 | 兼容 |
+| `DATE()`/`NOW()` | ✅ 支持 | 兼容 |
+| 窗口函数 | ✅ 支持（H2 2.x） | 新版本完整支持 |
+| `JSON` 类型 | ⚠️ 部分支持 | 可以存储但索引有限 |
+| `GROUP BY` 扩展 | ⚠️ 差异 | MySQL 的 `ONLY_FULL_GROUP_BY` 行为不同 |
+| 存储过程 | ❌ 不支持 | H2 不支持存储过程 |
+| 触发器 | ⚠️ 语法不同 | 需要单独编写 |
+
+#### 方案二：MariaDB4j（嵌入式 MariaDB）
+
+**MariaDB4j** 是一个可以在 JVM 进程中启动 MariaDB（MySQL 的兼容分支）的库。它会：
+1. 下载/解压 MariaDB 二进制文件
+2. 启动一个独立的 MariaDB 进程
+3. 应用结束时自动关闭
+
+**优势**：
+- 使用**真实的 MySQL 兼容数据库**
+- SQL 语法 100% 兼容
+
+**劣势**：
+- 启动较慢
+- 需要下载二进制文件
+- 不是真正的"嵌入式"（启动独立进程）
+
+##### 依赖配置
+
+```xml
+<dependencies>
+    <!-- MariaDB4j -->
+    <dependency>
+        <groupId>ch.vorburger.mariaDB4j</groupId>
+        <artifactId>mariaDB4j</artifactId>
+        <version>3.0.1</version>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- MariaDB JDBC 驱动 -->
+    <dependency>
+        <groupId>org.mariadb.jdbc</groupId>
+        <artifactId>mariadb-java-client</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+</dependencies>
+```
+
+##### 测试配置示例
+
+```java
+@SpringBootTest
+public class StudentRepositoryTest {
+    
+    private static MariaDB4jService mariaDB;
+    
+    @DynamicPropertySource
+    static void setProperties(DynamicPropertyRegistry registry) {
+        try {
+            // 启动嵌入式 MariaDB
+            DB db = DB.newEmbeddedDB(3307);
+            db.start();
+            
+            // 创建数据库
+            db.createDB("testdb");
+            
+            registry.add("spring.datasource.url", () -> 
+                "jdbc:mariadb://localhost:3307/testdb?useSSL=false");
+            registry.add("spring.datasource.username", () -> "root");
+            registry.add("spring.datasource.password", () -> "");
+            
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to start MariaDB4j", e);
+        }
+    }
+    
+    @Autowired
+    private StudentRepository studentRepository;
+    
+    @Test
+    void testSaveAndFind() {
+        // 使用真实的 MariaDB 进行测试
+        Student student = new Student();
+        student.setName("张三");
+        student.setMajor("计算机科学");
+        
+        Student saved = studentRepository.save(student);
+        
+        assertThat(saved.getId()).isNotNull();
+        assertThat(studentRepository.findById(saved.getId())).isPresent();
+    }
+}
+```
+
+#### 方案三：Testcontainers（容器化数据库）⭐ 推荐用于集成测试
+
+**Testcontainers** 是一个 Java 库，可以在测试时自动启动 Docker 容器中的真实数据库。
+
+**优势**：
+- 使用**真实的 MySQL 8.0**，SQL 语法 100% 兼容
+- 测试环境与生产环境完全一致
+- 测试结束后自动清理
+
+**劣势**：
+- 需要安装 Docker
+- 测试启动较慢
+
+##### 依赖配置
+
+```xml
+<dependencies>
+    <!-- Testcontainers Core -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- Testcontainers MySQL -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>mysql</artifactId>
+        <version>1.19.3</version>
+        <scope>test</scope>
+    </dependency>
+    
+    <!-- MySQL 驱动 -->
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    
+    <!-- JUnit 5 -->
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+##### 完整测试示例
+
+```java
+package com.example.repository;
+
+import com.example.entity.Student;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import java.util.List;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+@Testcontainers
+class StudentRepositoryTest {
+    
+    // 使用 MySQL 8.0 容器
+    @Container
+    static MySQLContainer<?> mysql = new MySQLContainer<>(
+        DockerImageName.parse("mysql:8.0.33")
+    )
+        .withDatabaseName("testdb")
+        .withUsername("test")
+        .withPassword("test")
+        .withInitScript("schema-mysql.sql")  // 可选：初始化脚本
+        .withCommand("--character-set-server=utf8mb4", 
+                    "--collation-server=utf8mb4_unicode_ci");
+    
+    @DynamicPropertySource
+    static void setProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", mysql::getJdbcUrl);
+        registry.add("spring.datasource.username", mysql::getUsername);
+        registry.add("spring.datasource.password", mysql::getPassword);
+        registry.add("spring.datasource.driver-class-name", mysql::getDriverClassName);
+    }
+    
+    @Autowired
+    private StudentRepository studentRepository;
+    
+    @Test
+    void testSaveStudent() {
+        // Given
+        Student student = new Student();
+        student.setName("张三");
+        student.setAge(20);
+        student.setGender("男");
+        student.setMajor("计算机科学");
+        
+        // When
+        Student saved = studentRepository.save(student);
+        
+        // Then
+        assertThat(saved.getId()).isNotNull();
+        assertThat(saved.getName()).isEqualTo("张三");
+    }
+    
+    @Test
+    void testFindById() {
+        // Given
+        Student student = new Student();
+        student.setName("李四");
+        student.setMajor("软件工程");
+        Student saved = studentRepository.save(student);
+        
+        // When
+        Optional<Student> found = studentRepository.findById(saved.getId());
+        
+        // Then
+        assertThat(found).isPresent();
+        assertThat(found.get().getName()).isEqualTo("李四");
+    }
+    
+    @Test
+    void testFindByMajor() {
+        // Given
+        studentRepository.save(createStudent("学生1", "计算机科学"));
+        studentRepository.save(createStudent("学生2", "计算机科学"));
+        studentRepository.save(createStudent("学生3", "软件工程"));
+        
+        // When
+        List<Student> csStudents = studentRepository.findByMajor("计算机科学");
+        
+        // Then
+        assertThat(csStudents).hasSize(2);
+    }
+    
+    private Student createStudent(String name, String major) {
+        Student student = new Student();
+        student.setName(name);
+        student.setMajor(major);
+        return student;
+    }
+}
+```
+
+#### 方案四：Docker Compose（开发环境）
+
+对于本地开发，可以使用 Docker Compose 启动一个真实的 MySQL 容器。
+
+**优势**：
+- 使用真实的 MySQL 8.0
+- 开发环境与生产环境一致
+- 可以预加载测试数据
+
+**`docker-compose.yml`**：
+
+```yaml
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0.33
+    container_name: mysql-dev
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: mydb
+      MYSQL_USER: dev
+      MYSQL_PASSWORD: dev
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql_data:
+```
+
+**`init.sql`**（初始化数据）：
+
+```sql
+CREATE TABLE IF NOT EXISTS student (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    age INT,
+    gender VARCHAR(10),
+    major VARCHAR(100)
+);
+
+CREATE TABLE IF NOT EXISTS score (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    student_id BIGINT NOT NULL,
+    subject VARCHAR(50) NOT NULL,
+    score DOUBLE,
+    exam_date DATE,
+    FOREIGN KEY (student_id) REFERENCES student(id)
+);
+
+-- 插入测试数据
+INSERT INTO student (name, age, gender, major) VALUES
+('张三', 20, '男', '计算机科学'),
+('李四', 21, '女', '软件工程'),
+('王五', 19, '男', '信息安全');
+```
+
+**开发配置**（`application-dev.properties`）：
+
+```properties
+spring.datasource.url=jdbc:mysql://localhost:3306/mydb?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8mb4
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+spring.datasource.username=dev
+spring.datasource.password=dev
+
+spring.datasource.hikari.maximum-pool-size=10
+```
+
+**使用方式**：
+
+```bash
+# 启动 MySQL 容器
+docker-compose up -d
+
+# 停止并删除容器（保留数据）
+docker-compose down
+
+# 完全清理（删除数据卷）
+docker-compose down -v
+```
+
+### 9.3 方案对比与选择建议
+
+| 方案 | 真实 MySQL | 启动速度 | 内存占用 | 适用场景 |
+| ---- | ---------- | -------- | -------- | -------- |
+| **H2 (MySQL 模式)** | ❌ 模拟 | ⚡ 极快 | 极小 | 单元测试、快速原型 |
+| **MariaDB4j** | ✅ 真实（MariaDB） | 🐢 较慢 | 较大 | 集成测试 |
+| **Testcontainers** | ✅ 真实 | 🐢 较慢 | 较大 | 集成测试、CI/CD |
+| **Docker Compose** | ✅ 真实 | 🐢 较慢 | 较大 | 本地开发、手动测试 |
+
+### 9.4 推荐策略
+
+#### 策略一：H2 + Testcontainers 组合（推荐）
+
+| 环境 | 数据库 | 理由 |
+| ---- | ------ | ---- |
+| **单元测试** | H2（内存模式） | 快速执行，隔离性好 |
+| **集成测试** | Testcontainers (MySQL 8.0) | 使用真实数据库，确保兼容性 |
+| **本地开发** | Docker Compose (MySQL 8.0) | 使用真实数据库，方便调试 |
+| **生产环境** | MySQL 8.0 | 稳定可靠 |
+
+#### 策略二：纯 Testcontainers（追求一致性）
+
+| 环境 | 数据库 | 理由 |
+| ---- | ------ | ---- |
+| **所有测试** | Testcontainers (MySQL 8.0) | 100% 语法兼容 |
+| **本地开发** | Docker Compose (MySQL 8.0) | 与测试环境一致 |
+| **生产环境** | MySQL 8.0 | 稳定可靠 |
+
+### 9.5 使用 ORM 层减少语法差异
+
+**核心建议**：如果使用 JPA（Hibernate）或 MyBatis 这样的 ORM 框架，可以大幅减少 SQL 语法差异的影响。
+
+#### JPA 示例
+
+```java
+@Repository
+public interface StudentRepository extends JpaRepository<Student, Long> {
+    
+    // JPA 自动生成 SQL，无需关心数据库差异
+    List<Student> findByMajorAndAgeGreaterThan(String major, Integer age);
+    
+    Optional<Student> findFirstByNameOrderByIdDesc(String name);
+    
+    long countByGender(String gender);
+    
+    // 对于复杂查询，使用 JPQL（数据库无关）
+    @Query("SELECT s FROM Student s WHERE s.age BETWEEN :min AND :max")
+    List<Student> findByAgeRange(@Param("min") Integer minAge, @Param("max") Integer maxAge);
+}
+```
+
+#### MyBatis 多数据库支持
+
+**`mybatis-config.xml`**：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE configuration PUBLIC "-//mybatis.org//DTD Config 3.0//EN" 
+    "http://mybatis.org/dtd/mybatis-3-config.dtd">
+<configuration>
+    <databaseIdProvider type="DB_VENDOR">
+        <property name="MySQL" value="mysql"/>
+        <property name="H2" value="h2"/>
+        <property name="SQLite" value="sqlite"/>
+    </databaseIdProvider>
+</configuration>
+```
+
+**Mapper XML**：
+
+```xml
+<mapper namespace="com.example.mapper.StudentMapper">
+    
+    <!-- 通用 SQL -->
+    <select id="findAll" resultType="Student">
+        SELECT id, name, age, gender, major FROM student
+    </select>
+    
+    <!-- MySQL 特定 SQL -->
+    <select id="findByNameLike" resultType="Student" databaseId="mysql">
+        SELECT * FROM student WHERE name LIKE CONCAT('%', #{name}, '%')
+    </select>
+    
+    <!-- H2/SQLite 特定 SQL -->
+    <select id="findByNameLike" resultType="Student" databaseId="h2">
+        SELECT * FROM student WHERE name LIKE '%' || #{name} || '%'
+    </select>
+    
+    <!-- SQLite 特定 SQL -->
+    <select id="findByNameLike" resultType="Student" databaseId="sqlite">
+        SELECT * FROM student WHERE name LIKE '%' || #{name} || '%'
+    </select>
+</mapper>
+```
+
+### 9.6 总结
+
+#### 核心结论
+
+1. **MySQL 没有官方嵌入式版本**：无法像 SQLite 一样运行在同一进程中
+2. **语法差异确实存在**：SQLite 和 MySQL 的 SQL 语法有差异，无法无缝切换
+3. **有替代方案**：
+   - **H2 (MySQL 模式)**：适合快速测试，但语法不完全兼容
+   - **MariaDB4j**：启动真实的 MariaDB 进程
+   - **Testcontainers**：在 Docker 容器中启动真实的 MySQL 8.0 ⭐
+   - **Docker Compose**：本地开发环境使用真实 MySQL
+
+#### 最佳实践建议
+
+**不要试图"开发用 SQLite，生产用 MySQL"**，因为：
+1. SQL 语法差异会导致测试不充分
+2. 数据类型行为不同（如日期、浮点数）
+3. 事务和锁行为不同
+
+**推荐的开发流程**：
+```
+开发环境：Docker Compose + MySQL 8.0
+         ↓
+单元测试：H2（内存模式）+ JPA
+         ↓
+集成测试：Testcontainers + MySQL 8.0
+         ↓
+生产环境：MySQL 8.0（主从/集群）
+```
+
+这样可以确保：
+- 开发时使用真实的 MySQL 语法
+- 单元测试快速执行
+- 集成测试验证真实兼容性
+- 生产环境稳定可靠
+
+---
+
 ## 附录：MySQL 8.0 版本历史
 
 | 版本 | 发布日期 | 主要特性 |
